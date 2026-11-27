@@ -43,10 +43,63 @@ def get_qt(qt_id):
     return d
 
 
+LIST_API = "https://www.dongan.org/api/qt?page=1&pageSize=10&keyword="
+
+
+def _find_items(obj):
+    """목록 응답 구조가 무엇이든 title이 있는 글 목록을 찾아냄"""
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj) and any("title" in x for x in obj):
+            return obj
+        for x in obj:
+            r = _find_items(x)
+            if r:
+                return r
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            r = _find_items(v)
+            if r:
+                return r
+    return []
+
+
+LIST_API = "https://www.dongan.org/api/qt?page=1&pageSize=10&keyword="
+
+
+def _find_items(obj):
+    """목록 응답에서 title 이 들어있는 글 목록을 찾아냄 (응답 구조가 달라도 동작)"""
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj) and any("title" in x for x in obj):
+            return obj
+        for x in obj:
+            r = _find_items(x)
+            if r:
+                return r
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            r = _find_items(v)
+            if r:
+                return r
+    return []
+
+
 def find_today_qt(today):
-    guess = BASE_ID + (today - BASE_DATE).days
     prefix = today.isoformat()
-    # 추정 번호부터 가까운 순서로 탐색
+    # 1) 큐티 게시판 목록에서 제목이 오늘 날짜로 시작하는 글 찾기
+    try:
+        items = _find_items(http_json(LIST_API))
+        print(f"[교회] 목록에서 {len(items)}개 글 확인")
+        for it in items:
+            if str(it.get("title", "")).startswith(prefix):
+                if it.get("content"):
+                    return it
+                d = get_qt(it.get("id"))
+                if d:
+                    return d
+    except Exception as e:  # noqa
+        print("[교회] 목록 읽기 실패:", repr(e))
+    # 2) 예비: 글 번호 추정 방식
+    guess = BASE_ID + (today - BASE_DATE).days
     for off in [0] + [s * i for i in range(1, SEARCH_RANGE + 1) for s in (1, -1)]:
         d = get_qt(guess + off)
         if d and str(d.get("title", "")).startswith(prefix):
@@ -95,12 +148,34 @@ def build_page(qt, today):
     for label in ["관찰 — 무엇이 눈에 띄었나", "깨달음 — 하나님은 어떤 분이신가", "적용 — 오늘 내가 할 일", "기도"]:
         children += [block("paragraph", label), block("paragraph", "")]
 
-    tags = [{"name": "큐티"}] + ([{"name": book}] if book else [])
-    props = {
-        "이름": {"title": rt(notion_title(today))},
-        "태그": {"multi_select": tags},
-    }
+    schema = db_schema()
+    title_prop = next((k for k, v in schema.items() if v.get("type") == "title"), "이름")
+    props = {title_prop: {"title": rt(notion_title(today))}}
+    for name, v in schema.items():  # 데이터베이스에 있는 열만 채움
+        t = v.get("type")
+        if t == "multi_select" and name == "태그":
+            props[name] = {"multi_select": [{"name": "큐티"}] + ([{"name": book}] if book else [])}
+        elif t == "date" and name == "날짜":
+            props[name] = {"date": {"start": today.isoformat()}}
+        elif t == "rich_text" and name == "본문":
+            props[name] = {"rich_text": rt(passage)}
+        elif t == "url" and name.replace(" ", "") == "원문링크":
+            props[name] = {"url": "https://www.dongan.org/dongan/page/s0506.html"}
     return {"parent": {"database_id": NOTION_DB}, "properties": props, "children": children[:100]}
+
+
+_SCHEMA = None
+
+
+def db_schema():
+    """노션 데이터베이스의 열 목록 (열 이름이 달라도 맞춰서 저장하기 위함)"""
+    global _SCHEMA
+    if _SCHEMA is None:
+        d = http_json(f"https://api.notion.com/v1/databases/{NOTION_DB}", headers=notion_headers())
+        _SCHEMA = d.get("properties", {})
+        print("[노션] 데이터베이스:", "".join(t.get("plain_text", "") for t in d.get("title", [])),
+              "/ 열:", ", ".join(_SCHEMA))
+    return _SCHEMA
 
 
 def notion_headers():
@@ -108,7 +183,8 @@ def notion_headers():
 
 
 def already_saved(today):
-    q = {"filter": {"property": "이름", "title": {"equals": notion_title(today)}}, "page_size": 1}
+    title_prop = next((k for k, v in db_schema().items() if v.get("type") == "title"), "이름")
+    q = {"filter": {"property": title_prop, "title": {"equals": notion_title(today)}}, "page_size": 1}
     res = http_json(f"https://api.notion.com/v1/databases/{NOTION_DB}/query", "POST", q, notion_headers())
     return bool(res.get("results"))
 
