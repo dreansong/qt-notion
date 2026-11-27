@@ -123,6 +123,13 @@ def rt(text):
         {"type": "text", "text": {"content": ""}}]
 
 
+APPLY_LABEL = "적용 — 오늘 내가 할 일 (저녁 9시에 점검해요)"
+
+
+def todo(text, checked=False):
+    return {"object": "block", "type": "to_do", "to_do": {"rich_text": rt(text), "checked": checked}}
+
+
 def block(kind, text=""):
     return {"object": "block", "type": kind, kind: {"rich_text": rt(text)}}
 
@@ -145,8 +152,11 @@ def build_page(qt, today):
     if commentary:
         children += [block("heading_3", "💡 본문 요약 및 해설"), block("quote", commentary)]
     children += [{"object": "block", "type": "divider", "divider": {}}, block("heading_3", "✍️ 나의 묵상")]
-    for label in ["관찰 — 무엇이 눈에 띄었나", "깨달음 — 하나님은 어떤 분이신가", "적용 — 오늘 내가 할 일", "기도"]:
+    for label in ["관찰 — 무엇이 눈에 띄었나", "깨달음 — 하나님은 어떤 분이신가"]:
         children += [block("paragraph", label), block("paragraph", "")]
+    # 적용은 체크박스로: 저녁 9시 점검 때 체크 여부를 확인함
+    children += [block("paragraph", APPLY_LABEL)] + [todo("") for _ in range(3)]
+    children += [block("paragraph", "기도"), block("paragraph", "")]
 
     schema = db_schema()
     title_prop = next((k for k, v in schema.items() if v.get("type") == "title"), "이름")
@@ -191,10 +201,15 @@ def already_saved(today):
 
 def main():
     today = datetime.now(KST).date()
-    if len(sys.argv) > 1:  # 특정 날짜 수동 실행: python qt_to_notion.py 2026-11-26
-        today = date.fromisoformat(sys.argv[1])
+    args = sys.argv[1:]
+    mode = "evening" if "evening" in args else "morning"
+    for a in args:  # 특정 날짜 수동 실행: python qt_to_notion.py 2026-11-26
+        if a[:2] == "20":
+            today = date.fromisoformat(a)
     if not NOTION_TOKEN or not NOTION_DB:
         sys.exit("NOTION_TOKEN / NOTION_DATABASE_ID 환경변수가 필요합니다.")
+    if mode == "evening":
+        return evening_check(today)
     # 1) 동안교회 게시물 제목에서 오늘 본문 찾기 (노션보다 먼저 확인)
     qt = find_today_qt(today)
     if not qt:
@@ -210,6 +225,108 @@ def main():
                  "→ 404면 노션 '큐티 자동저장' 통합이 My board/큐티에 연결되지 않았거나 DB ID가 다릅니다.")
     page = http_json("https://api.notion.com/v1/pages", "POST", build_page(qt, today), notion_headers())
     print("저장 완료:", qt["title"], page.get("url"))
+
+
+# ───────────────────────── 저녁 9시 적용 점검 ─────────────────────────
+NOTION_USER_ID = os.environ.get("NOTION_USER_ID", "a51b52e2-98b9-433f-bca8-f396dbf85e82")
+EVENING_HEADING = "🌙 저녁 점검"
+
+
+def _plain(b):
+    t = b.get(b["type"], {}).get("rich_text", [])
+    return "".join(x.get("plain_text", "") for x in t).strip()
+
+
+def find_today_page(today):
+    title_prop = next((k for k, v in db_schema().items() if v.get("type") == "title"), "이름")
+    q = {"filter": {"property": title_prop, "title": {"equals": notion_title(today)}}, "page_size": 1}
+    res = http_json(f"https://api.notion.com/v1/databases/{NOTION_DB}/query", "POST", q, notion_headers())
+    return (res.get("results") or [None])[0]
+
+
+def page_blocks(page_id):
+    blocks, cursor = [], None
+    while True:
+        url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+        if cursor:
+            url += f"&start_cursor={cursor}"
+        r = http_json(url, headers=notion_headers())
+        blocks += r.get("results", [])
+        if not r.get("has_more"):
+            return blocks
+        cursor = r.get("next_cursor")
+
+
+def apply_items(blocks):
+    """'적용' 문단 아래 ~ 다음 소제목(기도 등) 전까지의 체크박스/문단을 모음"""
+    items, inside = [], False
+    for b in blocks:
+        text = _plain(b) if b["type"] in ("paragraph", "to_do", "bulleted_list_item", "numbered_list_item",
+                                          "heading_2", "heading_3") else ""
+        if not inside:
+            if text.startswith("적용"):
+                inside = True
+            continue
+        if b["type"] in ("heading_2", "heading_3", "divider") or text.startswith("기도"):
+            break
+        if b["type"] == "to_do" and text:
+            items.append((text, b["to_do"].get("checked", False)))
+        elif b["type"] in ("paragraph", "bulleted_list_item", "numbered_list_item") and text:
+            items.append((text, None))  # 체크박스가 아닌 줄
+    return items, any(_plain(b).startswith(EVENING_HEADING) for b in blocks)
+
+
+def comment(page_id, text):
+    body = {"parent": {"page_id": page_id}, "rich_text": [
+        {"type": "mention", "mention": {"type": "user", "user": {"id": NOTION_USER_ID}}},
+        {"type": "text", "text": {"content": " " + text}}]}
+    http_json("https://api.notion.com/v1/comments", "POST", body, notion_headers())
+
+
+def evening_check(today):
+    page = find_today_page(today)
+    if not page:
+        sys.exit(f"[저녁] {notion_title(today)} 큐티 페이지가 없습니다.")
+    pid = page["id"]
+    items, already = apply_items(page_blocks(pid))
+    todos = [(t, c) for t, c in items if c is not None]
+    done = [t for t, c in todos if c]
+    left = [t for t, c in todos if not c]
+    notes = [t for t, c in items if c is None]
+
+    if not items:
+        msg = "오늘 큐티 '적용' 칸이 비어 있어요. 오늘 말씀에서 실천한 것 한 가지를 적고 하루를 돌아보세요 🙏"
+    elif todos and not left:
+        msg = f"오늘 적용 {len(done)}가지를 모두 지키셨네요 ✅ 잘하셨어요! 저녁 점검 칸에 감사한 점을 남겨 보세요."
+    elif todos:
+        msg = (f"오늘 적용 점검 시간이에요. {len(done)}/{len(todos)} 완료.\n남은 것: " + " / ".join(left) +
+               "\n했다면 체크(☑)하고, 못 했다면 저녁 점검 칸에 이유와 내일 다짐을 적어 보세요.")
+    else:
+        msg = "오늘 적용으로 적은 것: " + " / ".join(notes) + "\n잘 실천하셨나요? 저녁 점검 칸에 돌아보며 적어 보세요."
+
+    if not already:
+        summary = (f"적용 {len(done)}/{len(todos)} 완료" if todos else "적용 항목 확인") + (
+            " · 남은 것: " + ", ".join(left) if left else "")
+        children = [{"object": "block", "type": "divider", "divider": {}},
+                    block("heading_3", EVENING_HEADING), block("callout", summary),
+                    block("paragraph", "잘한 것 / 감사한 것"), block("paragraph", ""),
+                    block("paragraph", "아쉬운 것 / 못 한 이유"), block("paragraph", ""),
+                    block("paragraph", "내일 이어갈 것"), block("paragraph", "")]
+        http_json(f"https://api.notion.com/v1/blocks/{pid}/children", "PATCH", {"children": children}, notion_headers())
+
+    # 상태 열이 있으면(새 큐티 데이터베이스) 진행 상황 표시
+    st = next((k for k, v in db_schema().items() if v.get("type") == "status" and k == "상태"), None)
+    if st and todos:
+        name = "완료" if not left else "진행 중"
+        http_json(f"https://api.notion.com/v1/pages/{pid}", "PATCH",
+                  {"properties": {st: {"status": {"name": name}}}}, notion_headers())
+
+    try:
+        comment(pid, msg)  # 댓글 + 멘션 → 노션 앱 알림
+        print("[저녁] 알림 댓글 남김:", msg.replace("\n", " "))
+    except urllib.error.HTTPError as e:
+        print(f"[저녁] 댓글 실패({e.code}) — 노션 통합의 '댓글 삽입' 기능을 켜 주세요:", e.read().decode()[:200])
+    print("[저녁] 점검 완료:", page.get("url"))
 
 
 if __name__ == "__main__":
