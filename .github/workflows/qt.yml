@@ -1,4 +1,3 @@
-yaml
 name: 오늘의 큐티 → 노션
 on:
   schedule:
